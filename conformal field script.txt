@@ -1,0 +1,775 @@
+--[[
+    Conformal Terrain Field v6
+
+    Visual energy field around the player that conforms to Roblox terrain
+    AND meshes (MeshParts / BaseParts).
+
+    v6 changes:
+      * Mesh tracing — raycasts now accept any BasePart, not only
+        workspace.Terrain.  Set CFG.traceMeshes = false to revert.
+      * fieldScale — single number that uniformly scales the entire
+        field (radius, heights, tile sizes, outline width, etc.)
+      * Extended wall tracing — wall height range doubled and step
+        halved for smooth cliff coverage; diagonal (angled-up) rays
+        added so overhangs and tall cliffs are no longer missed.
+      * Stable CFrame on vertical normals — surfaceCFrame now uses a
+        robust world-up fallback so tiles on vertical / near-vertical
+        surfaces no longer flip or distort.
+      * All v5 fixes retained (adaptive heightDown, slope float,
+        slope tile scale, outline continuity filter).
+
+    Compatible with The Wild West custom character model.
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local CoreGui          = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+
+local localPlayer = Players.LocalPlayer
+
+-- ═══════════════════════════════════════════════════════════
+-- CONFIGURATION
+-- ═══════════════════════════════════════════════════════════
+local CFG = {
+    -- ── Field scale ──
+    -- Multiplies radius, heights, tile sizes, outline, etc.
+    -- 1 = default, 0.5 = half-size, 2 = double-size.
+    fieldScale    = 1,
+
+    -- Geometry (before scale)
+    radius        = 40,
+    heightUp      = 10,
+    heightDown    = 20,
+
+    -- Interior sampling
+    ringSpacing   = 4,
+    arcSpacing    = 4,
+
+    -- Wall detection
+    wallEnabled    = true,
+    wallHeightUp   = 25,      -- how far above player to scan walls
+    wallHeightDown = 5,       -- how far below player to scan walls
+    wallHeightStep = 1.5,     -- vertical step between wall ray rows
+    wallAngles     = 48,
+    wallDiagAngles = 24,      -- extra diagonal (angled-up) rays per row
+
+    -- ── Tracing targets ──
+    traceMeshes    = true,    -- true = trace all BaseParts; false = terrain only
+
+    -- ── adaptive vertical origin ──
+    adaptiveVertical   = true,
+    adaptiveSlopeRatio = 1.0,
+
+    -- ── slope-adaptive infill ──
+    slopeAdaptive      = true,
+    slopeThreshold     = 0.70,
+
+    -- ── slope float/size compensation ──
+    slopeFloatExtra    = 0.5,
+    slopeTileScale     = 0.55,
+
+    -- Outline ring
+    outlineAngles     = 120,
+    outlineWidth      = 2.4,
+    outlineDepth      = 1.0,
+    outlineColor      = Color3.fromRGB(255, 255, 255),
+    outlineTransp     = 0.15,
+    outlineThickness  = 0.2,
+    outlineFloat      = 0.35,
+
+    -- Performance
+    updateInterval = 0.1,
+
+    -- Interior visuals
+    color             = Color3.fromRGB(0, 170, 255),
+    material          = Enum.Material.Neon,
+    thickness         = 0.18,
+    floatOffset       = 0.4,
+    baseTransparency  = 0.68,
+    pulseAmplitude    = 0.08,
+    pulseSpeed        = 1.5,
+    edgeFadeStart     = 0.55,
+    partOverlap       = 1.55,
+
+    -- Wall visuals
+    wallTransparency  = 0.60,
+}
+
+-- ═══════════════════════════════════════════════════════════
+-- SCALED ACCESSORS
+-- ═══════════════════════════════════════════════════════════
+local function S(val) return val * CFG.fieldScale end
+
+-- ═══════════════════════════════════════════════════════════
+-- STATE
+-- ═══════════════════════════════════════════════════════════
+local enabled        = false
+local folder         = nil
+local interiorPool   = {}
+local outlinePool    = {}
+local activeInterior = {}
+local activeOutline  = {}
+local sampleGrid     = nil
+local lastHitCount   = 0
+local lastScale      = nil   -- rebuilt grid when scale changes
+
+-- ═══════════════════════════════════════════════════════════
+-- CLEANUP PREVIOUS INSTANCE
+-- ═══════════════════════════════════════════════════════════
+local env = (getgenv and getgenv()) or _G
+if type(env._CONFORMAL_FIELD_STOP) == "function" then
+    pcall(env._CONFORMAL_FIELD_STOP)
+    task.wait(0.15)
+end
+
+for _, root in ipairs({CoreGui, localPlayer and localPlayer:FindFirstChild("PlayerGui")}) do
+    if root then
+        local old = root:FindFirstChild("ConformalFieldGui")
+        if old then pcall(function() old:Destroy() end) end
+    end
+end
+do
+    local f = workspace:FindFirstChild("ConformalTerrainField")
+    if f then pcall(function() f:Destroy() end) end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- CHARACTER ROOT  (TWW compatible)
+-- ═══════════════════════════════════════════════════════════
+local function getRoot()
+    local ents = workspace:FindFirstChild("WORKSPACE_Entities")
+    if ents then
+        local pf = ents:FindFirstChild("Players")
+        if pf then
+            local tww = pf:FindFirstChild(localPlayer.Name)
+            if tww then
+                local r = tww:FindFirstChild("HumanoidRootPart")
+                    or tww:FindFirstChild("Body")
+                    or tww.PrimaryPart
+                    or tww:FindFirstChildWhichIsA("BasePart", true)
+                if r then return r end
+            end
+        end
+    end
+    local char = localPlayer.Character
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+        or char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Torso")
+        or char:FindFirstChild("Head")
+        or char:FindFirstChildWhichIsA("BasePart")
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- PART POOLS
+-- ═══════════════════════════════════════════════════════════
+local function makeInteriorPart()
+    local p = Instance.new("Part")
+    p.Anchored     = true
+    p.CanCollide    = false
+    p.CanTouch      = false
+    p.CanQuery      = false
+    p.CastShadow    = false
+    p.Material      = CFG.material
+    p.Color         = CFG.color
+    p.Transparency  = CFG.baseTransparency
+    p.Size          = Vector3.new(1, CFG.thickness, 1)
+    p.TopSurface    = Enum.SurfaceType.Smooth
+    p.BottomSurface = Enum.SurfaceType.Smooth
+    return p
+end
+
+local function makeOutlinePart()
+    local p = Instance.new("Part")
+    p.Anchored     = true
+    p.CanCollide    = false
+    p.CanTouch      = false
+    p.CanQuery      = false
+    p.CastShadow    = false
+    p.Material      = Enum.Material.Neon
+    p.Color         = CFG.outlineColor
+    p.Transparency  = CFG.outlineTransp
+    p.Size          = Vector3.new(S(CFG.outlineWidth), CFG.outlineThickness, S(CFG.outlineDepth))
+    p.TopSurface    = Enum.SurfaceType.Smooth
+    p.BottomSurface = Enum.SurfaceType.Smooth
+    return p
+end
+
+local function acquireInterior()
+    local p = table.remove(interiorPool) or makeInteriorPart()
+    p.Parent = folder
+    return p
+end
+local function acquireOutline()
+    local p = table.remove(outlinePool) or makeOutlinePart()
+    p.Parent = folder
+    return p
+end
+local function releaseInterior(p) p.Parent = nil; table.insert(interiorPool, p) end
+local function releaseOutline(p)  p.Parent = nil; table.insert(outlinePool, p)  end
+
+local function releaseAll()
+    for i = #activeInterior, 1, -1 do releaseInterior(activeInterior[i]); activeInterior[i] = nil end
+    for i = #activeOutline,  1, -1 do releaseOutline(activeOutline[i]);   activeOutline[i]  = nil end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- SAMPLE GRID  (interior rings — excludes outermost ring)
+-- ═══════════════════════════════════════════════════════════
+local function buildSampleGrid()
+    sampleGrid = {}
+    sampleGrid[#sampleGrid + 1] = {dx = 0, dz = 0, dist = 0, angle = 0}
+
+    local spacing = S(CFG.ringSpacing)
+    local arcSp   = S(CFG.arcSpacing)
+    local rad     = S(CFG.radius)
+    local r = spacing
+    local innerLimit = rad - spacing * 0.5
+    while r <= innerLimit do
+        local circ = 2 * math.pi * r
+        local n = math.max(6, math.floor(circ / arcSp))
+        local step = (2 * math.pi) / n
+        for i = 0, n - 1 do
+            local a = i * step
+            sampleGrid[#sampleGrid + 1] = {
+                dx    = math.cos(a) * r,
+                dz    = math.sin(a) * r,
+                dist  = r,
+                angle = a,
+            }
+        end
+        r = r + spacing
+    end
+    lastScale = CFG.fieldScale
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- ADAPTIVE SEARCH HEIGHT
+-- ═══════════════════════════════════════════════════════════
+local function searchUp(dist)
+    if CFG.adaptiveVertical then
+        return math.max(S(CFG.heightUp), dist * CFG.adaptiveSlopeRatio)
+    end
+    return S(CFG.heightUp)
+end
+
+local function searchDown(dist)
+    if CFG.adaptiveVertical then
+        return math.max(S(CFG.heightDown), dist * CFG.adaptiveSlopeRatio)
+    end
+    return S(CFG.heightDown)
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- HIT ACCEPTANCE
+-- ═══════════════════════════════════════════════════════════
+local function acceptHit(result)
+    if not result then return false end
+    if result.Instance == workspace.Terrain then return true end
+    if CFG.traceMeshes and result.Instance:IsA("BasePart") then return true end
+    return false
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- CFrame HELPERS  (stable on vertical normals)
+-- ═══════════════════════════════════════════════════════════
+local WORLD_UP    = Vector3.new(0, 1, 0)
+local WORLD_RIGHT = Vector3.new(1, 0, 0)
+local WORLD_FWD   = Vector3.new(0, 0, 1)
+
+local function surfaceCFrame(pos, normal, floatDist)
+    local up = normal
+
+    -- Choose a hint vector that isn't parallel to the normal.
+    -- For near-vertical normals (walls/cliffs), using world-up as
+    -- the hint would collapse the cross product, so we use world-forward.
+    local hint
+    if math.abs(up.Y) > 0.9 then
+        hint = WORLD_FWD
+    else
+        hint = WORLD_UP
+    end
+
+    local right = up:Cross(hint)
+    if right.Magnitude < 0.001 then right = up:Cross(WORLD_RIGHT) end
+    right = right.Unit
+    local forward = right:Cross(up).Unit
+
+    local steepness = math.max(0, 1 - math.abs(normal.Y))
+    local slopeBias = steepness * CFG.slopeFloatExtra
+    return CFrame.fromMatrix(pos + normal * floatDist + Vector3.new(0, slopeBias, 0), right, up, -forward)
+end
+
+local function outlineCFrame(pos, normal, angle, floatDist)
+    local tangent = Vector3.new(-math.sin(angle), 0, math.cos(angle))
+    local projected = tangent - normal * tangent:Dot(normal)
+    if projected.Magnitude < 0.001 then projected = tangent end
+    projected = projected.Unit
+    local up = normal
+    local right = projected
+    local forward = right:Cross(up)
+    if forward.Magnitude < 0.001 then return surfaceCFrame(pos, normal, floatDist) end
+    forward = forward.Unit
+    local steepness = math.max(0, 1 - math.abs(normal.Y))
+    local slopeBias = steepness * CFG.slopeFloatExtra
+    return CFrame.fromMatrix(pos + normal * floatDist + Vector3.new(0, slopeBias, 0), right, up, -forward)
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- SINGLE-POINT RAYCAST HELPER
+-- ═══════════════════════════════════════════════════════════
+local function probePoint(x, z, dist, rootPosY, rayParams)
+    local upH    = searchUp(dist)
+    local downH  = searchDown(dist)
+    local total  = upH + downH
+    local results = {}
+
+    -- ground
+    local dO = Vector3.new(x, rootPosY + upH, z)
+    local dR = workspace:Raycast(dO, Vector3.new(0, -total, 0), rayParams)
+    if acceptHit(dR) then
+        results[#results + 1] = {
+            pos = dR.Position, normal = dR.Normal, dist = dist, kind = "ground",
+        }
+    end
+
+    -- ceiling
+    local uO = Vector3.new(x, rootPosY - 2, z)
+    local uR = workspace:Raycast(uO, Vector3.new(0, upH + 2, 0), rayParams)
+    if acceptHit(uR) then
+        local dominated = false
+        if acceptHit(dR) then
+            if (dR.Position - uR.Position).Magnitude < 0.6 then dominated = true end
+        end
+        if not dominated then
+            results[#results + 1] = {
+                pos = uR.Position, normal = uR.Normal, dist = dist, kind = "ceiling",
+            }
+        end
+    end
+
+    return results
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- FIELD UPDATE
+-- ═══════════════════════════════════════════════════════════
+local statusLabel = nil
+
+local function updateField()
+    local root = getRoot()
+    if not root then
+        releaseAll(); lastHitCount = 0
+        if statusLabel then statusLabel.Text = "No character" end
+        return
+    end
+
+    -- Rebuild sample grid if scale changed or first run
+    if not sampleGrid or lastScale ~= CFG.fieldScale then
+        buildSampleGrid()
+    end
+
+    local rootPos = root.Position
+    local rad = S(CFG.radius)
+
+    -- Build exclusion list: our own folder + player character parts
+    local excludeList = {folder}
+    local char = localPlayer.Character
+    if char then excludeList[#excludeList + 1] = char end
+    local ents = workspace:FindFirstChild("WORKSPACE_Entities")
+    if ents then
+        local pf = ents:FindFirstChild("Players")
+        if pf then
+            local tww = pf:FindFirstChild(localPlayer.Name)
+            if tww then excludeList[#excludeList + 1] = tww end
+        end
+    end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = excludeList
+
+    -- ── 1. PRIMARY INTERIOR PASS ─────────────────────────────
+    local interiorHits = {}
+
+    for _, s in ipairs(sampleGrid) do
+        local pts = probePoint(rootPos.X + s.dx, rootPos.Z + s.dz, s.dist, rootPos.Y, rayParams)
+        for _, h in ipairs(pts) do
+            h._angle = s.angle
+            interiorHits[#interiorHits + 1] = h
+        end
+    end
+
+    -- ── 2. SLOPE-ADAPTIVE INFILL ─────────────────────────────
+    if CFG.slopeAdaptive then
+        local infillPoints = {}
+        local halfArc  = S(CFG.arcSpacing) * 0.5
+        local halfRing = S(CFG.ringSpacing) * 0.5
+
+        for _, hit in ipairs(interiorHits) do
+            if hit.kind == "ground" and hit.normal.Y < CFG.slopeThreshold then
+                local a = hit._angle or 0
+                local d = hit.dist
+                if d < 1 then d = 1 end
+
+                local dAngle = halfArc / d
+                for _, da in ipairs({-dAngle, dAngle}) do
+                    local a2 = a + da
+                    infillPoints[#infillPoints + 1] = {
+                        dx   = math.cos(a2) * d,
+                        dz   = math.sin(a2) * d,
+                        dist = d,
+                    }
+                end
+
+                for _, dr in ipairs({-halfRing, halfRing}) do
+                    local d2 = d + dr
+                    if d2 > 0 and d2 < rad then
+                        infillPoints[#infillPoints + 1] = {
+                            dx   = math.cos(a) * d2,
+                            dz   = math.sin(a) * d2,
+                            dist = d2,
+                        }
+                    end
+                end
+            end
+        end
+
+        for _, s in ipairs(infillPoints) do
+            local pts = probePoint(rootPos.X + s.dx, rootPos.Z + s.dz, s.dist, rootPos.Y, rayParams)
+            for _, h in ipairs(pts) do
+                interiorHits[#interiorHits + 1] = h
+            end
+        end
+    end
+
+    -- ── 3. WALLS ─────────────────────────────────────────────
+    if CFG.wallEnabled then
+        local aStep = (2 * math.pi) / CFG.wallAngles
+        local wallUp   = S(CFG.wallHeightUp)
+        local wallDown = S(CFG.wallHeightDown)
+        local wallStep = S(CFG.wallHeightStep)
+        local wallReach = rad - 2
+
+        local h = -wallDown
+        while h <= wallUp do
+            local oY = rootPos.Y + h
+            for i = 0, CFG.wallAngles - 1 do
+                local a = i * aStep
+
+                -- horizontal wall ray
+                local dirH = Vector3.new(math.cos(a), 0, math.sin(a))
+                local o = Vector3.new(rootPos.X, oY, rootPos.Z)
+                local r = workspace:Raycast(o, dirH * wallReach, rayParams)
+                if acceptHit(r) then
+                    local hd = (r.Position - Vector3.new(rootPos.X, r.Position.Y, rootPos.Z)).Magnitude
+                    if hd <= rad then
+                        interiorHits[#interiorHits + 1] = {
+                            pos = r.Position, normal = r.Normal, dist = hd, kind = "wall",
+                        }
+                    end
+                end
+
+                -- diagonal ray (angled 35° upward) for overhangs and
+                -- cliff faces that lean away from horizontal rays
+                if i % math.max(1, math.floor(CFG.wallAngles / CFG.wallDiagAngles)) == 0 then
+                    local diagDir = Vector3.new(math.cos(a), 0.7, math.sin(a)).Unit * wallReach
+                    local rd = workspace:Raycast(o, diagDir, rayParams)
+                    if acceptHit(rd) then
+                        local hd2 = (rd.Position - Vector3.new(rootPos.X, rd.Position.Y, rootPos.Z)).Magnitude
+                        if hd2 <= rad then
+                            interiorHits[#interiorHits + 1] = {
+                                pos = rd.Position, normal = rd.Normal, dist = hd2, kind = "wall",
+                            }
+                        end
+                    end
+                end
+            end
+            h = h + wallStep
+        end
+    end
+
+    -- ── 4. DEDUPLICATE ───────────────────────────────────────
+    local RES = S(1.8)
+    local occ = {}
+    local dedupedInterior = {}
+    for _, hit in ipairs(interiorHits) do
+        local kx = math.floor(hit.pos.X / RES + 0.5)
+        local ky = math.floor(hit.pos.Y / RES + 0.5)
+        local kz = math.floor(hit.pos.Z / RES + 0.5)
+        local key = kx .. "," .. ky .. "," .. kz
+        if not occ[key] then
+            occ[key] = true
+            dedupedInterior[#dedupedInterior + 1] = hit
+        end
+    end
+
+    -- ── 5. OUTLINE ───────────────────────────────────────────
+    local outlineHits = {}
+    local outlineAngleStep = (2 * math.pi) / CFG.outlineAngles
+    for i = 0, CFG.outlineAngles - 1 do
+        local angle = i * outlineAngleStep
+        local ox = rootPos.X + math.cos(angle) * rad
+        local oz = rootPos.Z + math.sin(angle) * rad
+
+        local upH    = searchUp(rad)
+        local downH  = searchDown(rad)
+        local total  = upH + downH
+
+        local dO = Vector3.new(ox, rootPos.Y + upH, oz)
+        local dR = workspace:Raycast(dO, Vector3.new(0, -total, 0), rayParams)
+        if acceptHit(dR) then
+            outlineHits[#outlineHits + 1] = {
+                pos = dR.Position, normal = dR.Normal, angle = angle,
+            }
+        end
+
+        local uO = Vector3.new(ox, rootPos.Y - 2, oz)
+        local uR = workspace:Raycast(uO, Vector3.new(0, upH + 2, 0), rayParams)
+        if acceptHit(uR) then
+            local dominated = false
+            if acceptHit(dR) then
+                if (dR.Position - uR.Position).Magnitude < 0.6 then dominated = true end
+            end
+            if not dominated then
+                outlineHits[#outlineHits + 1] = {
+                    pos = uR.Position, normal = uR.Normal, angle = angle,
+                }
+            end
+        end
+    end
+
+    -- ── 5b. OUTLINE CONTINUITY FILTER ─────────────────────
+    local filteredOutline = {}
+    if #outlineHits > 0 then
+        local hitByIndex = {}
+        for _, oh in ipairs(outlineHits) do
+            local idx = math.floor(oh.angle / outlineAngleStep + 0.5) % CFG.outlineAngles
+            hitByIndex[idx] = oh
+        end
+        for idx, oh in pairs(hitByIndex) do
+            local prev = (idx - 1) % CFG.outlineAngles
+            local nxt  = (idx + 1) % CFG.outlineAngles
+            if hitByIndex[prev] or hitByIndex[nxt] then
+                filteredOutline[#filteredOutline + 1] = oh
+            end
+        end
+    end
+    outlineHits = filteredOutline
+
+    lastHitCount = #dedupedInterior + #outlineHits
+
+    -- ── PULSE ────────────────────────────────────────────────
+    local t = tick()
+    local pulse = math.sin(t * CFG.pulseSpeed * 2 * math.pi) * 0.5 + 0.5
+
+    -- ── SYNC INTERIOR PARTS ──────────────────────────────────
+    while #activeInterior < #dedupedInterior do
+        activeInterior[#activeInterior + 1] = acquireInterior()
+    end
+    while #activeInterior > #dedupedInterior do
+        releaseInterior(table.remove(activeInterior))
+    end
+
+    local tileSize = S(CFG.arcSpacing) * CFG.partOverlap
+
+    for i, hit in ipairs(dedupedInterior) do
+        local part = activeInterior[i]
+        local floatAmt = CFG.floatOffset
+        if hit.kind == "ceiling" then floatAmt = -CFG.floatOffset end
+
+        part.CFrame = surfaceCFrame(hit.pos, hit.normal, floatAmt)
+
+        if hit.kind == "wall" then
+            local ws = S(CFG.wallHeightStep) * CFG.partOverlap
+            part.Size = Vector3.new(ws, CFG.thickness, ws)
+        else
+            local steepness = math.max(0, 1 - math.abs(hit.normal.Y))
+            local scaleFactor = 1 - steepness * (1 - CFG.slopeTileScale)
+            local ts = tileSize * scaleFactor
+            part.Size = Vector3.new(ts, CFG.thickness, ts)
+        end
+
+        local edgeAlpha = 1
+        if hit.dist > rad * CFG.edgeFadeStart then
+            edgeAlpha = 1 - (hit.dist - rad * CFG.edgeFadeStart)
+                          / (rad * (1 - CFG.edgeFadeStart))
+            edgeAlpha = math.clamp(edgeAlpha, 0, 1)
+        end
+
+        local baseTrans = hit.kind == "wall" and CFG.wallTransparency or CFG.baseTransparency
+        local trans = baseTrans + CFG.pulseAmplitude * pulse
+        part.Transparency = 1 - (1 - trans) * edgeAlpha
+        part.Color   = CFG.color
+        part.Material = CFG.material
+    end
+
+    -- ── SYNC OUTLINE PARTS ───────────────────────────────────
+    while #activeOutline < #outlineHits do
+        activeOutline[#activeOutline + 1] = acquireOutline()
+    end
+    while #activeOutline > #outlineHits do
+        releaseOutline(table.remove(activeOutline))
+    end
+
+    for i, hit in ipairs(outlineHits) do
+        local part = activeOutline[i]
+        part.CFrame   = outlineCFrame(hit.pos, hit.normal, hit.angle, CFG.outlineFloat)
+        part.Size     = Vector3.new(S(CFG.outlineWidth), CFG.outlineThickness, S(CFG.outlineDepth))
+        part.Color    = CFG.outlineColor
+        part.Material = Enum.Material.Neon
+        part.Transparency = CFG.outlineTransp + CFG.pulseAmplitude * 0.3 * pulse
+    end
+
+    if statusLabel then statusLabel.Text = tostring(lastHitCount) .. " hits" end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- START / STOP
+-- ═══════════════════════════════════════════════════════════
+local function startField()
+    if enabled then return end
+    enabled = true
+    folder = Instance.new("Folder")
+    folder.Name = "ConformalTerrainField"
+    folder.Parent = workspace
+    task.spawn(function()
+        while enabled do
+            local ok, err = pcall(updateField)
+            if not ok then warn("[ConformalField] " .. tostring(err)) end
+            task.wait(CFG.updateInterval)
+        end
+    end)
+end
+
+local function stopField()
+    enabled = false
+    task.wait(CFG.updateInterval + 0.05)
+    releaseAll()
+    if folder then pcall(function() folder:Destroy() end); folder = nil end
+    lastHitCount = 0
+    if statusLabel then statusLabel.Text = "" end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- GUI
+-- ═══════════════════════════════════════════════════════════
+local gui = Instance.new("ScreenGui")
+gui.Name           = "ConformalFieldGui"
+gui.ResetOnSpawn   = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder   = 100
+do
+    local ok = pcall(function() gui.Parent = CoreGui end)
+    if not ok and localPlayer then gui.Parent = localPlayer:WaitForChild("PlayerGui") end
+end
+
+local btnFrame = Instance.new("Frame")
+btnFrame.Name             = "ToggleFrame"
+btnFrame.Size             = UDim2.new(0, 140, 0, 52)
+btnFrame.Position         = UDim2.new(0, 16, 1, -68)
+btnFrame.AnchorPoint      = Vector2.new(0, 1)
+btnFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+btnFrame.BorderSizePixel  = 0
+btnFrame.Parent           = gui
+Instance.new("UICorner", btnFrame).CornerRadius = UDim.new(0, 10)
+
+local btnStroke = Instance.new("UIStroke")
+btnStroke.Color     = Color3.fromRGB(55, 55, 75)
+btnStroke.Thickness = 1.5
+btnStroke.Parent    = btnFrame
+
+local btn = Instance.new("TextButton")
+btn.Name                   = "Toggle"
+btn.Size                   = UDim2.new(1, 0, 0, 32)
+btn.Position               = UDim2.new(0, 0, 0, 2)
+btn.BackgroundTransparency = 1
+btn.BorderSizePixel        = 0
+btn.Font                   = Enum.Font.GothamBold
+btn.TextSize               = 14
+btn.TextColor3             = Color3.fromRGB(190, 190, 200)
+btn.Text                   = "Field: OFF"
+btn.AutoButtonColor        = false
+btn.Parent                 = btnFrame
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.Name                   = "Status"
+statusLabel.Size                   = UDim2.new(1, 0, 0, 16)
+statusLabel.Position               = UDim2.new(0, 0, 1, -18)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Font                   = Enum.Font.Gotham
+statusLabel.TextSize               = 11
+statusLabel.TextColor3             = Color3.fromRGB(120, 120, 140)
+statusLabel.Text                   = ""
+statusLabel.Parent                 = btnFrame
+
+-- drag support
+local dragging, dragStart, startPos = false, nil, nil
+
+btnFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging  = true
+        dragStart = input.Position
+        startPos  = btnFrame.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                  or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        btnFrame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end
+end)
+
+local OFF_BG     = Color3.fromRGB(22, 22, 30)
+local OFF_STROKE = Color3.fromRGB(55, 55, 75)
+local OFF_TEXT   = Color3.fromRGB(190, 190, 200)
+local ON_BG      = Color3.fromRGB(10, 45, 65)
+local ON_STROKE  = CFG.color
+local ON_TEXT     = CFG.color
+
+local function doToggle()
+    if enabled then
+        stopField()
+        btn.Text                  = "Field: OFF"
+        btnFrame.BackgroundColor3 = OFF_BG
+        btnStroke.Color           = OFF_STROKE
+        btn.TextColor3            = OFF_TEXT
+    else
+        startField()
+        btn.Text                  = "Field: ON"
+        btnFrame.BackgroundColor3 = ON_BG
+        btnStroke.Color           = ON_STROKE
+        btn.TextColor3            = ON_TEXT
+    end
+end
+
+UserInputService.InputEnded:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1
+                  or input.UserInputType == Enum.UserInputType.Touch) then
+        local moved = (input.Position - dragStart).Magnitude
+        dragging = false
+        if moved < 5 then doToggle() end
+    end
+end)
+
+btn.MouseButton1Click:Connect(function()
+    if not dragging then doToggle() end
+end)
+
+-- ═══════════════════════════════════════════════════════════
+-- GLOBAL CLEANUP
+-- ═══════════════════════════════════════════════════════════
+env._CONFORMAL_FIELD_STOP = function()
+    stopField()
+    pcall(function() gui:Destroy() end)
+end
+
+warn("[ConformalField] v6 loaded — mesh tracing + fieldScale + improved cliff tracing")
