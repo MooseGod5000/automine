@@ -13679,6 +13679,7 @@ function trySellLootNearTarget(targetPart, targetInstance, character)
 		end
 		if sold then
 			local soldLootValue = getSoldLootValue(lootSummaryBefore, lootSummaryAfter)
+			automineWebhookTotals.totalEarned = (tonumber(automineWebhookTotals.totalEarned) or 0) + math.max(0, soldLootValue)
 			local soldMessage = soldLootValue > 0
 				and ("Sold $" .. formatMoneyAmount(soldLootValue) .. " worth of ores.")
 				or "Sold ores."
@@ -13686,6 +13687,18 @@ function trySellLootNearTarget(targetPart, targetInstance, character)
 				spawnNotification(soldMessage, "success", true, 3)
 			else
 				notifyUser("Success", soldMessage, 3)
+			end
+			if isAutomineWebhookOptionEnabled("Track earnings") then
+				local elapsed = math.max(0, os.clock() - (tonumber(automineWebhookTotals.serverStartedAt) or os.clock()))
+				sendAutomineWebhookMessage(
+					"Automine Sell",
+					string.format(
+						"Sold: $%s\nServer runtime: %ds\nTotal earned: $%s",
+						formatMoneyAmount(soldLootValue),
+						math.floor(elapsed + 0.5),
+						formatMoneyAmount(automineWebhookTotals.totalEarned)
+					)
+				)
 			end
 			return true
 		end
@@ -14102,6 +14115,46 @@ function getHttpRequestFunction()
 	return nil
 end
 
+local automineWebhookTotals = {
+	totalEarned = 0,
+	serverStartedAt = os.clock(),
+	lastDeathHopAt = 0,
+}
+
+local function isValidDiscordWebhook(url)
+	url = tostring(url or "")
+	return url:match("^https://discord%.com/api/webhooks/%d+/.+") ~= nil
+end
+
+local function isAutomineWebhookOptionEnabled(optionName)
+	return S.discordAutomineWebhookOptions and S.discordAutomineWebhookOptions[optionName] == true
+end
+
+local function sendAutomineWebhookMessage(title, description)
+	if not (S.discordAutomineWebhookTrackingEnabled and isValidDiscordWebhook(S.discordAutomineWebhookUrl)) then
+		return false
+	end
+	local requestFn = getHttpRequestFunction()
+	if type(requestFn) ~= "function" then
+		return false
+	end
+	local payload = {
+		content = "",
+		embeds = {{
+			title = tostring(title or "Automine Update"),
+			description = tostring(description or ""),
+			color = 5814783,
+		}},
+	}
+	pcall(requestFn, {
+		Url = S.discordAutomineWebhookUrl,
+		Method = "POST",
+		Headers = {["Content-Type"] = "application/json"},
+		Body = _HttpService:JSONEncode(payload),
+	})
+	return true
+end
+
 function getCurrentScriptFilePath()
 	if type(debug) ~= "table" or type(debug.info) ~= "function" then
 		local cachedPath = runtimeEnv.__FOB_LAST_SCRIPT_FILE_PATH
@@ -14393,6 +14446,9 @@ function tryPathServerHop(reasonText, resumeSlotIndex, forceHop)
 	end
 
 	local normalizedResumeSlotIndex = normalizePathSlotIndex(resumeSlotIndex)
+	if isAutomineWebhookOptionEnabled("Track flags") then
+		sendAutomineWebhookMessage("Automine Flag", "Serverhop triggered: " .. tostring(reasonText or "Unknown reason"))
+	end
 	serverHopInProgress = true
 	setStatus("Finding a smaller server...", Color3.fromRGB(120, 190, 255))
 	setServerHopStatus(tostring(reasonText or "Finding a smaller public server..."), Color3.fromRGB(120, 190, 255))
@@ -22794,6 +22850,22 @@ do
         )
         pathUi.staffHopSync = staffHopSync
 
+        local _, _, hopOnDeathSync = createToggleRow(
+            "Hop on death",
+            pathUi.pathRowsPage,
+            function()
+                return pathState.hopOnDeathEnabled == true
+            end,
+            function()
+                pathState.hopOnDeathEnabled = not (pathState.hopOnDeathEnabled == true)
+                S.pathHopOnDeathEnabled = pathState.hopOnDeathEnabled
+                savePathsToStorage(false)
+                schedulePersist()
+                refreshPathManagerButtons()
+            end
+        )
+        pathUi.hopOnDeathSync = hopOnDeathSync
+
         local _, _, farmPathsSync = createToggleRow(
             "Farm paths",
             pathUi.pathRowsPage,
@@ -23160,6 +23232,25 @@ do
                 ensurePlayerFeatureHooks()
                 syncAllUi()
             end
+        end
+    end)
+
+    _RunService.Heartbeat:Connect(function()
+        if not (pathState and pathState.hopOnDeathEnabled == true and not serverHopInProgress) then
+            return
+        end
+        local now = os.clock()
+        if (now - (tonumber(automineWebhookTotals.lastDeathHopAt) or 0)) < 4 then
+            return
+        end
+        local worldEntities = workspace:FindFirstChild("WORKSPACE_Entities")
+        local playersFolder = worldEntities and worldEntities:FindFirstChild("Players")
+        local localWorldModel = playersFolder and playersFolder:FindFirstChild("localuser")
+        local worldHumanoid = localWorldModel and localWorldModel:FindFirstChild("Humanoid")
+        local humanoid = worldHumanoid or cachedHumanoid or getHumanoid(cachedCharacter or getCustomCharacter())
+        if humanoid and humanoid.Health <= 0 then
+            automineWebhookTotals.lastDeathHopAt = now
+            tryPathServerHop("Character died, hopping servers...", getPathCycleRestartSlotIndex(), true)
         end
     end)
 
